@@ -1,6 +1,7 @@
 import re
 from argparse import ArgumentParser
 from operator import attrgetter
+from termcolor import cprint
 
 from prompt_toolkit import prompt
 from prompt_toolkit.document import Document
@@ -8,7 +9,10 @@ from prompt_toolkit.shortcuts import checkboxlist_dialog, radiolist_dialog
 from prompt_toolkit.validation import ValidationError, Validator
 
 from fastapi_template.input_model import (
+    SUPPORTED_ORMS,
+    ORMS_WITHOUT_MIGRATIONS,
     ORM,
+    APIType,
     BuilderContext,
     DB_INFO,
     DatabaseType,
@@ -45,6 +49,14 @@ def parse_args():
         help="Project description",
     )
     parser.add_argument(
+        "--api-type",
+        help="API type",
+        type=str,
+        choices=list(map(attrgetter("value"), APIType)),
+        default=None,
+        dest="api_type",
+    )
+    parser.add_argument(
         "--db",
         help="Database",
         type=str,
@@ -70,10 +82,17 @@ def parse_args():
     )
     parser.add_argument(
         "--redis",
-        help="Add redis support",
+        help="Add Redis support",
         action="store_true",
         default=None,
         dest="enable_redis",
+    )
+    parser.add_argument(
+        "--rabbit",
+        help="Add RabbitMQ support",
+        action="store_true",
+        default=None,
+        dest="enable_rmq",
     )
     parser.add_argument(
         "--migrations",
@@ -84,7 +103,7 @@ def parse_args():
     )
     parser.add_argument(
         "--kube",
-        help="Add kubernetes configs",
+        help="Add Kubernetes configs",
         action="store_true",
         default=None,
         dest="enable_kube",
@@ -99,17 +118,38 @@ def parse_args():
     )
     parser.add_argument(
         "--routers",
-        help="Add exmaple routers",
+        help="Add example routers",
         action="store_true",
         default=None,
         dest="enable_routers",
     )
     parser.add_argument(
         "--swagger",
-        help="Eanble self-hosted swagger",
+        help="Enable self-hosted Swagger",
         action="store_true",
         default=None,
         dest="self_hosted_swagger",
+    )
+    parser.add_argument(
+        "--prometheus",
+        help="Add prometheus integration",
+        action="store_true",
+        default=None,
+        dest="prometheus_enabled",
+    )
+    parser.add_argument(
+        "--sentry",
+        help="Add sentry integration",
+        action="store_true",
+        default=None,
+        dest="sentry_enabled",
+    )
+    parser.add_argument(
+        "--opentelemetry",
+        help="Add opentelemetry integration",
+        action="store_true",
+        default=None,
+        dest="otlp_enabled",
     )
     parser.add_argument(
         "--force",
@@ -117,6 +157,13 @@ def parse_args():
         action="store_true",
         default=False,
         dest="force",
+    )
+    parser.add_argument(
+        "--quite",
+        help="Do not ask for features during generation",
+        action="store_true",
+        default=False,
+        dest="quite",
     )
 
     return parser.parse_args()
@@ -140,6 +187,22 @@ def ask_features(current_context: BuilderContext) -> BuilderContext:
             "name": "self_hosted_swagger",
             "value": current_context.self_hosted_swagger,
         },
+        "RabbitMQ integration": {
+            "name": "enable_rmq",
+            "value": current_context.enable_rmq,
+        },
+        "Prometheus integration": {
+            "name": "prometheus_enabled",
+            "value": current_context.prometheus_enabled,
+        },
+        "Sentry integration": {
+            "name": "sentry_enabled",
+            "value": current_context.sentry_enabled,
+        },
+        "Opentelemetry integration": {
+            "name": "otlp_enabled",
+            "value": current_context.otlp_enabled,
+        },
     }
     if current_context.db != DatabaseType.none:
         features["Migrations support"] = {
@@ -155,7 +218,7 @@ def ask_features(current_context: BuilderContext) -> BuilderContext:
         if feature["value"] is None:
             setattr(current_context, feature["name"], False)
             checkbox_values.append((feature["name"], feature_name))
-    if checkbox_values:
+    if checkbox_values and not current_context.quite:
         results = checkboxlist_dialog(
             title="Features",
             text="What features do you wanna add?",
@@ -176,6 +239,14 @@ def read_user_input(current_context: BuilderContext) -> BuilderContext:
     current_context.kube_name = current_context.project_name.replace("_", "-")
     if current_context.project_description is None:
         current_context.project_description = prompt("Project description: ")
+    if current_context.api_type is None:
+        current_context.api_type = radiolist_dialog(
+            "API type",
+            text="Which api type do you want?",
+            values=[(api, api.value) for api in list(APIType)],
+        ).run()
+        if current_context.api_type is None:
+            raise KeyboardInterrupt()
     if current_context.db is None:
         current_context.db = radiolist_dialog(
             "Databases",
@@ -192,10 +263,19 @@ def read_user_input(current_context: BuilderContext) -> BuilderContext:
         current_context.orm = radiolist_dialog(
             "ORM",
             text="Which ORM do you want?",
-            values=[(orm, orm.value) for orm in list(ORM) if orm != ORM.none],
+            values=[(orm, orm.value) for orm in SUPPORTED_ORMS[current_context.db]],
         ).run()
         if current_context.orm is None:
             raise KeyboardInterrupt()
+    if (
+        current_context.orm is not None 
+        and current_context.orm != ORM.none 
+        and current_context.orm not in SUPPORTED_ORMS.get(current_context.db, [])
+    ):
+        cprint("This ORM is not supported by chosen database.", "red")
+        raise KeyboardInterrupt()
+    if current_context.orm in ORMS_WITHOUT_MIGRATIONS:
+        current_context.enable_migrations = False
     if current_context.ci_type is None:
         current_context.ci_type = radiolist_dialog(
             "CI",

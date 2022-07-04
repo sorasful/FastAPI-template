@@ -49,10 +49,12 @@ Currently SQLAlchemy1.4, TortoiseORM and Ormar are supported.
 TUI and CLI and excellent code documentation.
 
 Generator features:
+- You can choose between GraphQL and REST api;
 - Different databases support;
 - Different ORMs support;
-- Optional migrations for each ORM;
+- Optional migrations for each ORM except raw drivers;
 - redis support;
+- rabbitmq support;
 - different CI\CD;
 - Kubernetes config generation;
 - Demo routers and models;
@@ -67,10 +69,12 @@ $ python -m fastapi_template --help
 
 usage: FastAPI template [-h] [--version] [--name PROJECT_NAME]
                         [--description PROJECT_DESCRIPTION]
+                        [--api-type {rest,graphql}]
                         [--db {none,sqlite,mysql,postgresql}]
-                        [--orm {ormar,sqlalchemy,tortoise}]
-                        [--ci {none,gitlab,github}] [--redis] [--migrations]
-                        [--kube] [--dummy] [--routers] [--swagger] [--force]
+                        [--orm {ormar,sqlalchemy,tortoise,psycopg,piccolo}]
+                        [--ci {none,gitlab_ci,github}] [--redis] [--rabbit]
+                        [--migrations] [--kube] [--dummy] [--routers]
+                        [--swagger] [--force] [--quite]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -78,18 +82,22 @@ optional arguments:
   --name PROJECT_NAME   Name of your awesome project
   --description PROJECT_DESCRIPTION
                         Project description
+  --api-type {rest,graphql}
+                        API type
   --db {none,sqlite,mysql,postgresql}
                         Database
-  --orm {ormar,sqlalchemy,tortoise}
+  --orm {ormar,sqlalchemy,tortoise,psycopg,piccolo}
                         ORM
-  --ci {none,gitlab,github}
+  --ci {none,gitlab_ci,github}
                         Choose CI support
-  --redis               Add redis support
+  --redis               Add Redis support
+  --rabbit              Add RabbitMQ support
   --migrations          Add migrations support
-  --kube                Add kubernetes configs
+  --kube                Add Kubernetes configs
   --dummy, --dummy-model
                         Add dummy model
-  --routers             Add exmaple routers
-  --swagger             Eanble self-hosted swagger
+  --routers             Add example routers
+  --swagger             Enable self-hosted Swagger
   --force               Owerrite directory if it exists
+  --quite               Do not ask for features during generation
 ```

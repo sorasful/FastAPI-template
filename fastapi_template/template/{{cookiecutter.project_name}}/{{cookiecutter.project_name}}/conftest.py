@@ -1,16 +1,26 @@
 import asyncio
 from asyncio.events import AbstractEventLoop
 import sys
-from typing import Generator, AsyncGenerator
+from typing import Any, Generator, AsyncGenerator
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from httpx import AsyncClient
+import uuid
+from unittest.mock import Mock
+
 {%- if cookiecutter.enable_redis == "True" %}
 from fakeredis.aioredis import FakeRedis
 from {{cookiecutter.project_name}}.services.redis.dependency import get_redis_connection
 {%- endif %}
+{%- if cookiecutter.enable_rmq == "True" %}
+from aio_pika import Channel
+from aio_pika.abc import AbstractExchange, AbstractQueue
+from aio_pika.pool import Pool
+from {{cookiecutter.project_name}}.services.rabbit.dependencies import get_rmq_channel_pool
+from {{cookiecutter.project_name}}.services.rabbit.lifetime import init_rabbit, shutdown_rabbit
 
+{%- endif %}
 from {{cookiecutter.project_name}}.settings import settings
 from {{cookiecutter.project_name}}.web.application import get_app
 
@@ -22,41 +32,41 @@ from {{cookiecutter.project_name}}.db.dependencies import get_db_session
 from {{cookiecutter.project_name}}.db.utils import create_database, drop_database
 {%- elif cookiecutter.orm == "tortoise" %}
 from tortoise.contrib.test import finalizer, initializer
-from {{cookiecutter.project_name}}.db.config import MODELS_MODULES
+from tortoise import Tortoise
+from {{cookiecutter.project_name}}.db.config import MODELS_MODULES, TORTOISE_CONFIG
+import nest_asyncio
+
+nest_asyncio.apply()
 {%- elif cookiecutter.orm == "ormar" %}
 from sqlalchemy.engine import create_engine
 from {{cookiecutter.project_name}}.db.config import database
 from {{cookiecutter.project_name}}.db.utils import create_database, drop_database
+{%- elif cookiecutter.orm == "psycopg" %}
+from psycopg import AsyncConnection
+from psycopg_pool import AsyncConnectionPool
+
+from {{cookiecutter.project_name}}.db.dependencies import get_db_session
+{%- elif cookiecutter.orm == "piccolo" %}
+{%- if cookiecutter.db_info.name == "postgresql" %}
+from piccolo.engine.postgres import PostgresEngine
+{%- endif %}
+from piccolo.table import create_tables, drop_tables
+
+from piccolo.conf.apps import Finder
 {%- endif %}
 
-import nest_asyncio
-
-nest_asyncio.apply()
 
 @pytest.fixture(scope="session")
-def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
+def anyio_backend() -> str:
     """
-    Create an instance of event loop for tests.
+    Backend for anyio pytest plugin.
 
-    This hack is required in order to get `dbsession` fixture to work.
-    Because default fixture `event_loop` is function scoped,
-    but dbsession requires session scoped `event_loop` fixture.
-
-    :yields: event loop.
+    :return: backend name.
     """
-    python_version = sys.version_info[:2]
-    if sys.platform.startswith("win") and python_version >= (3, 8):
-        # Avoid "RuntimeError: Event loop is closed" on Windows when tearing down tests
-        # https://github.com/encode/httpx/issues/914
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+    return 'asyncio'
 
 {%- if cookiecutter.orm == "sqlalchemy" %}
 @pytest.fixture(scope="session")
-@pytest.mark.asyncio
 async def _engine() -> AsyncGenerator[AsyncEngine, None]:
     """
     Create engine and databases.
@@ -80,9 +90,10 @@ async def _engine() -> AsyncGenerator[AsyncEngine, None]:
         await engine.dispose()
         await drop_database()
 
-@pytest.fixture()
-@pytest.mark.asyncio
-async def dbsession(_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
+@pytest.fixture
+async def dbsession(
+    _engine: AsyncEngine,
+) -> AsyncGenerator[AsyncSession, None]:
     """
     Get session to database.
 
@@ -107,46 +118,30 @@ async def dbsession(_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
         await trans.rollback()
         await connection.close()
 
-
-@pytest.fixture()
-@pytest.mark.asyncio
-async def transaction(_engine: AsyncEngine) -> AsyncGenerator[AsyncConnection, None]:
-    """
-    Create and obtain a transaction.
-
-    :param _engine: current database engine.
-    :yield: connection.
-    """
-    conn = await _engine.begin()
-    try:
-        yield conn
-    finally:
-        await conn.rollback()
 {%- elif cookiecutter.orm == "tortoise" %}
 
 @pytest.fixture(autouse=True)
-def initialize_db(event_loop: AbstractEventLoop) -> Generator[None, None, None]:
+async def initialize_db() -> AsyncGenerator[None, None]:
     """
     Initialize models and database.
 
-    :param event_loop: Session-wide event loop.
     :yields: Nothing.
     """
     initializer(
         MODELS_MODULES,
         db_url=str(settings.db_url),
         app_label="models",
-        loop=event_loop,
     )
+    await Tortoise.init(config=TORTOISE_CONFIG)
 
     yield
 
+    await Tortoise.close_connections()
     finalizer()
 
 {%- elif cookiecutter.orm == "ormar" %}
 
 @pytest.fixture(autouse=True)
-@pytest.mark.asyncio
 async def initialize_db() -> AsyncGenerator[None, None]:
     """
     Create models and databases.
@@ -168,32 +163,271 @@ async def initialize_db() -> AsyncGenerator[None, None]:
 
     await database.connect()
 
-    yield None
+    yield
 
     await database.disconnect()
     drop_database()
 
+{%- elif cookiecutter.orm == "psycopg" %}
+
+async def drop_db() -> None:
+    """Drops database after tests."""
+    pool = AsyncConnectionPool(conninfo=str(settings.db_url.with_path("/postgres")))
+    await pool.wait()
+    async with pool.connection() as conn:
+        await conn.set_autocommit(True)
+        await conn.execute(
+            "SELECT pg_terminate_backend(pg_stat_activity.pid) "  # noqa: S608
+            "FROM pg_stat_activity "
+            "WHERE pg_stat_activity.datname = %(dbname)s "
+            "AND pid <> pg_backend_pid();",
+            params={
+                "dbname": settings.db_base,
+            }
+        )
+        await conn.execute(
+            f"DROP DATABASE {settings.db_base}",
+        )
+    await pool.close()
+
+
+async def create_db() -> None:  # noqa: WPS217
+    """Creates database for tests."""
+    pool = AsyncConnectionPool(conninfo=str(settings.db_url.with_path("/postgres")))
+    await pool.wait()
+    async with pool.connection() as conn_check:
+        res = await conn_check.execute(
+            "SELECT 1 FROM pg_database WHERE datname=%(dbname)s",
+            params={
+                "dbname": settings.db_base,
+            }
+        )
+        db_exists = False
+        row = await res.fetchone()
+        if row is not None:
+            db_exists = row[0]
+
+    if db_exists:
+        await drop_db()
+
+    async with pool.connection() as conn_create:
+        await conn_create.set_autocommit(True)
+        await conn_create.execute(
+            f"CREATE DATABASE {settings.db_base};",
+        )
+    await pool.close()
+
+
+async def create_tables(connection: AsyncConnection[Any]) -> None:
+    """
+    Create tables for your database.
+
+    Since psycopg doesn't have migration tool,
+    you must create your tables for tests.
+
+    :param connection: connection to database.
+    """
+    {%- if cookiecutter.add_dummy == 'True' %}
+    await connection.execute(
+        "CREATE TABLE dummy ("
+        "id SERIAL primary key,"
+        "name VARCHAR(200)"
+        ");"
+    )
+    {%- endif %}
+    pass  # noqa: WPS420
+
+
+@pytest.fixture
+async def dbsession() -> AsyncGenerator[AsyncConnection[Any], None]:
+    """
+    Creates connection to some test database.
+
+    This connection must be used in tests and for application.
+
+    :yield: connection to database.
+    """
+    await create_db()
+    pool = AsyncConnectionPool(conninfo=str(settings.db_url))
+    await pool.wait()
+
+    async with pool.connection() as create_conn:
+        await create_tables(create_conn)
+
+    try:
+        async with pool.connection() as conn:
+            yield conn
+    finally:
+        await pool.close()
+        await drop_db()
+
+{%- elif cookiecutter.orm == "piccolo" %}
+
+{%- if cookiecutter.db_info.name == "postgresql" %}
+async def drop_database(engine: PostgresEngine) -> None:
+    """
+    Drops test database.
+
+    :param engine: engine connected to postgres database.
+    """
+    await engine.run_ddl(
+        "SELECT pg_terminate_backend(pg_stat_activity.pid) "  # noqa: S608
+        "FROM pg_stat_activity "
+        f"WHERE pg_stat_activity.datname = '{settings.db_base}' "
+        "AND pid <> pg_backend_pid();",
+    )
+    await engine.run_ddl(
+        f"DROP DATABASE {settings.db_base};",
+    )
 {%- endif %}
 
+@pytest.fixture(autouse=True)
+async def setup_db() -> AsyncGenerator[None, None]:
+    """
+    Fixture to create all tables before test and drop them after.
+
+    :yield: nothing.
+    """
+    {%- if cookiecutter.db_info.name == "postgresql" %}
+    engine = PostgresEngine(
+        config={
+            "database": "postgres",
+            "user": settings.db_user,
+            "password": settings.db_pass,
+            "host": settings.db_host,
+            "port": settings.db_port,
+        },
+    )
+    await engine.start_connection_pool()
+
+    db_exists = await engine.run_ddl(
+        f"SELECT 1 FROM pg_database WHERE datname='{settings.db_base}'"  # noqa: S608
+    )
+    if db_exists:
+        await drop_database(engine)
+    await engine.run_ddl(f"CREATE DATABASE {settings.db_base}")
+    {%- endif %}
+    tables = Finder().get_table_classes()
+    create_tables(*tables, if_not_exists=True)
+
+    yield
+
+    drop_tables(*tables)
+    {%- if cookiecutter.db_info.name == "postgresql" %}
+    await drop_database(engine)
+    {%- endif %}
+
+{%- endif %}
+
+{%- if cookiecutter.enable_rmq == 'True' %}
+
+@pytest.fixture
+async def test_rmq_pool() -> AsyncGenerator[Channel, None]:
+    """
+    Create rabbitMQ pool.
+
+    :yield: channel pool.
+    """
+    app_mock = Mock()
+    init_rabbit(app_mock)
+    yield app_mock.state.rmq_channel_pool
+    await shutdown_rabbit(app_mock)
+
+
+@pytest.fixture
+async def test_exchange_name() -> str:
+    """
+    Name of an exchange to use in tests.
+
+    :return: name of an exchange.
+    """
+    return uuid.uuid4().hex
+
+
+@pytest.fixture
+async def test_routing_key() -> str:
+    """
+    Name of routing key to use whild binding test queue.
+
+    :return: key string.
+    """
+    return uuid.uuid4().hex
+
+
+@pytest.fixture
+async def test_exchange(
+    test_exchange_name: str,
+    test_rmq_pool: Pool[Channel],
+) -> AsyncGenerator[AbstractExchange, None]:
+    """
+    Creates test exchange.
+
+    :param test_exchange_name: name of an exchange to create.
+    :param test_rmq_pool: channel pool for rabbitmq.
+    :yield: created exchange.
+    """
+    async with test_rmq_pool.acquire() as conn:
+        exchange = await conn.declare_exchange(
+            name=test_exchange_name,
+            auto_delete=True,
+        )
+        yield exchange
+
+        await exchange.delete(if_unused=False)
+
+
+@pytest.fixture
+async def test_queue(
+    test_exchange: AbstractExchange,
+    test_rmq_pool: Pool[Channel],
+    test_routing_key: str,
+) -> AsyncGenerator[AbstractQueue, None]:
+    """
+    Creates queue connected to exchange.
+
+    :param test_exchange: exchange to bind queue to.
+    :param test_rmq_pool: channel pool for rabbitmq.
+    :param test_routing_key: routing key to use while binding.
+    :yield: queue binded to test exchange.
+    """
+    async with test_rmq_pool.acquire() as conn:
+        queue = await conn.declare_queue(name=uuid.uuid4().hex)
+        await queue.bind(
+            exchange=test_exchange,
+            routing_key=test_routing_key,
+        )
+        yield queue
+
+        await queue.delete(if_unused=False, if_empty=False)
+
+{%- endif %}
 
 {% if cookiecutter.enable_redis == "True" -%}
-@pytest.fixture()
-def fake_redis() -> FakeRedis:
+@pytest.fixture
+async def fake_redis() -> AsyncGenerator[FakeRedis, None]:
     """
     Get instance of a fake redis.
 
-    :return: FakeRedis instance.
+    :yield: FakeRedis instance.
     """
-    return FakeRedis(decode_responses=True)
+    redis = FakeRedis(decode_responses=True)
+    yield redis
+    await redis.close()
+
 {%- endif %}
 
-@pytest.fixture()
+@pytest.fixture
 def fastapi_app(
     {%- if cookiecutter.orm == "sqlalchemy" %}
     dbsession: AsyncSession,
+    {%- elif cookiecutter.orm == "psycopg" %}
+    dbsession: AsyncConnection[Any],
     {%- endif %}
     {% if cookiecutter.enable_redis == "True" -%}
     fake_redis: FakeRedis,
+    {%- endif %}
+    {%- if cookiecutter.enable_rmq == 'True' %}
+    test_rmq_pool: Pool[Channel],
     {%- endif %}
 ) -> FastAPI:
     """
@@ -202,23 +436,28 @@ def fastapi_app(
     :return: fastapi app with mocked dependencies.
     """
     application = get_app()
-    {% if cookiecutter.orm == "sqlalchemy" -%}
+    {% if cookiecutter.orm in ["sqlalchemy", "psycopg"] -%}
     application.dependency_overrides[get_db_session] = lambda: dbsession
     {%- endif %}
     {%- if cookiecutter.enable_redis == "True" %}
     application.dependency_overrides[get_redis_connection] = lambda: fake_redis
     {%- endif %}
-
+    {%- if cookiecutter.enable_rmq == 'True' %}
+    application.dependency_overrides[get_rmq_channel_pool] = lambda: test_rmq_pool
+    {%- endif %}
     return application  # noqa: WPS331
 
-@pytest.fixture(scope="function")
-def client(
+
+@pytest.fixture
+async def client(
     fastapi_app: FastAPI,
-) -> TestClient:
+    anyio_backend: Any
+) -> AsyncGenerator[AsyncClient, None]:
     """
     Fixture that creates client for requesting server.
 
     :param fastapi_app: the application.
-    :return: client for the app.
+    :yield: client for the app.
     """
-    return TestClient(app=fastapi_app)
+    async with AsyncClient(app=fastapi_app, base_url="http://test") as ac:
+            yield ac

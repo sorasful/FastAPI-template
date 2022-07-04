@@ -5,6 +5,11 @@ from pydantic import BaseModel
 
 
 @enum.unique
+class APIType(enum.Enum):
+    rest = "rest"
+    graphql = "graphql"
+
+@enum.unique
 class DatabaseType(enum.Enum):
     none = "none"
     sqlite = "sqlite"
@@ -24,6 +29,8 @@ class ORM(enum.Enum):
     ormar = "ormar"
     sqlalchemy = "sqlalchemy"
     tortoise = "tortoise"
+    psycopg = "psycopg"
+    piccolo = "piccolo"
 
 
 class Database(BaseModel):
@@ -45,7 +52,7 @@ DB_INFO = {
     ),
     DatabaseType.postgresql: Database(
         name=DatabaseType.postgresql.value,
-        image="postgres:13.4-buster",
+        image="postgres:13.6-bullseye",
         async_driver="postgresql+asyncpg",
         driver_short="postgres",
         driver="postgresql",
@@ -53,7 +60,7 @@ DB_INFO = {
     ),
     DatabaseType.mysql: Database(
         name=DatabaseType.mysql.value,
-        image="bitnami/mysql:8.0.26",
+        image="bitnami/mysql:8.0.28",
         async_driver="mysql+aiomysql",
         driver_short="mysql",
         driver="mysql",
@@ -69,10 +76,34 @@ DB_INFO = {
     ),
 }
 
+SUPPORTED_ORMS = {
+    DatabaseType.postgresql: [
+        ORM.ormar,
+        ORM.psycopg,
+        ORM.tortoise,
+        ORM.sqlalchemy,
+        ORM.piccolo,
+    ],
+    DatabaseType.sqlite: [
+        ORM.ormar,
+        ORM.tortoise,
+        ORM.sqlalchemy,
+        ORM.piccolo,
+    ],
+    DatabaseType.mysql: [
+        ORM.ormar,
+        ORM.tortoise,
+        ORM.sqlalchemy,
+    ]
+}
+
+ORMS_WITHOUT_MIGRATIONS = [
+    ORM.psycopg,
+]
 
 class BuilderContext(BaseModel):
     """Options for project generation."""
-
+    api_type: Optional[APIType]
     project_name: Optional[str]
     kube_name: Optional[str]
     project_description: Optional[str]
@@ -84,9 +115,14 @@ class BuilderContext(BaseModel):
     enable_migrations: Optional[bool]
     enable_kube: Optional[bool]
     enable_routers: Optional[bool]
-    add_dummy: Optional[bool] = False
+    add_dummy: Optional[bool]
     self_hosted_swagger: Optional[bool]
+    prometheus_enabled: Optional[bool]
+    sentry_enabled: Optional[bool]
+    otlp_enabled: Optional[bool]
+    enable_rmq: Optional[bool]
     force: bool = False
+    quite: bool = False
 
     class Config:
         orm_mode = True

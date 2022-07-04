@@ -22,6 +22,8 @@ ignore =
   D106,
   ; First line should be in imperative mood
   D401,
+  ; Found wrong variable name
+  WPS110,
   ; Found `__init__.py` module with logic
   WPS326,
   ; Found string constant over-use
@@ -60,6 +62,12 @@ ignore =
   WPS404,
   ;  not perform function calls in argument defaults (for dependency injection)
   B008,
+  ; Model should define verbose_name in its Meta inner class
+  DJ10,
+  ; Model should define verbose_name_plural in its Meta inner class
+  DJ11,
+  ; Found mutable module constant.
+  WPS407,
 
 per-file-ignores =
   ; all tests
@@ -74,6 +82,8 @@ per-file-ignores =
   WPS432,
   ; Missing parameter(s) in Docstring
   DAR101,
+  ; Found too many arguments
+  WPS211,
 
   ; all init files
   __init__.py:
